@@ -63,7 +63,9 @@ def safe_get(url, headers, params=None, label="API"):
     """Make a GET request, return JSON or empty dict on failure."""
     try:
         r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
+        if not r.ok:
+            print(f"  [WARN] {label} returned HTTP {r.status_code}: {r.text[:500]}")
+            return {}
         return r.json()
     except Exception as e:
         print(f"  [WARN] {label} request failed: {e}")
@@ -74,7 +76,9 @@ def safe_post(url, headers, json_body=None, label="API"):
     """Make a POST request, return JSON or empty dict on failure."""
     try:
         r = requests.post(url, headers=headers, json=json_body, timeout=30)
-        r.raise_for_status()
+        if not r.ok:
+            print(f"  [WARN] {label} returned HTTP {r.status_code}: {r.text[:500]}")
+            return {}
         return r.json()
     except Exception as e:
         print(f"  [WARN] {label} request failed: {e}")
@@ -96,7 +100,12 @@ def check_already_ran():
         }
     }
     data = safe_post(url, notion_headers(), body, "Notion dedup query")
+    if not data:
+        print("  [WARN] Could not check for duplicates — proceeding anyway")
+        return False
     results = data.get("results", [])
+    if results:
+        print(f"  Found {len(results)} existing entry for today — skipping.")
     return len(results) > 0
 
 
@@ -468,12 +477,21 @@ def write_to_notion(metrics, health_status, health_reason, suggestions, supabase
         ),
     }
 
-    resp = safe_post(url, notion_headers(), body, "Notion create page")
-    if resp.get("id"):
-        print(f"  ✅ Notion page created: {resp['id']}")
-        return True
-    else:
-        print(f"  ❌ Failed to create Notion page: {resp}")
+    try:
+        r = requests.post(url, headers=notion_headers(), json=body, timeout=30)
+        print(f"  Notion API response: HTTP {r.status_code}")
+        if not r.ok:
+            print(f"  ❌ Notion API error: {r.text[:1000]}")
+            return False
+        resp = r.json()
+        if resp.get("id"):
+            print(f"  ✅ Notion page created: {resp['id']}")
+            return True
+        else:
+            print(f"  ❌ Unexpected Notion response (no id): {json.dumps(resp)[:500]}")
+            return False
+    except Exception as e:
+        print(f"  ❌ Notion request exception: {e}")
         return False
 
 
