@@ -26,6 +26,7 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = "99b63a76ad824864926bf22a274a4c71"
+NOTION_ANALYTICS_PAGE_ID = "3397f77c9b3881f7b6e4e5889925e999"
 
 STRIPE_WEBHOOK_DONE_FLAG = os.path.join(
     os.path.dirname(__file__), "..", ".stripe_webhook_done"
@@ -165,6 +166,30 @@ def fetch_posthog_dau(date_from, date_to):
         counts = series_item.get("data", [])
         return {d: int(c) for d, c in zip(days, counts)}
     return {}
+
+
+def fetch_posthog_tab_views(date_from, date_to):
+    """Fetch tab_viewed counts broken down by tab name property."""
+    url = f"{POSTHOG_HOST}/api/projects/{POSTHOG_PROJECT_ID}/insights/trend/"
+    params = {
+        "events": json.dumps([{
+            "id": "tab_viewed",
+            "math": "total",
+            "properties": [],
+        }]),
+        "breakdown": "tab name",
+        "breakdown_type": "event",
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    data = safe_get(url, posthog_headers(), params, "PostHog tab views")
+    tab_counts = {}
+    for series_item in data.get("result", []):
+        label = series_item.get("breakdown_value", series_item.get("label", "unknown"))
+        total = sum(int(c) for c in series_item.get("data", []))
+        if label and label != "unknown":
+            tab_counts[label] = total
+    return tab_counts
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +521,186 @@ def write_to_notion(metrics, health_status, health_reason, suggestions, supabase
 
 
 # ---------------------------------------------------------------------------
+# 5b. Analytics page — refresh "dear date — analytics"
+# ---------------------------------------------------------------------------
+
+
+def _clear_page_blocks(page_id):
+    """Delete all existing content blocks from a Notion page."""
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    data = safe_get(url, notion_headers(), label="Notion list blocks")
+    block_ids = [b["id"] for b in data.get("results", []) if b.get("id")]
+    for bid in block_ids:
+        try:
+            r = requests.delete(
+                f"https://api.notion.com/v1/blocks/{bid}",
+                headers=notion_headers(), timeout=15,
+            )
+            if not r.ok:
+                print(f"  [WARN] Failed to delete block {bid}: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"  [WARN] Failed to delete block {bid}: {e}")
+    print(f"  Cleared {len(block_ids)} blocks from analytics page.")
+
+
+def _bar(pct, width=20):
+    """Render a text progress bar."""
+    filled = round(pct / 100 * width)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def build_analytics_blocks(metrics, suggestions, tab_counts):
+    """Build the content blocks for the analytics page."""
+    blocks = []
+
+    def heading2(text):
+        return {
+            "object": "block", "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        }
+
+    def paragraph(text):
+        return {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        }
+
+    def divider():
+        return {"object": "block", "type": "divider", "divider": {}}
+
+    # Header
+    blocks.append(paragraph(
+        f"\U0001f48c dear date analytics \u00b7 last refreshed {TODAY_DISPLAY} "
+        f"\u00b7 updates every morning at 9 AM ET"
+    ))
+    blocks.append(divider())
+
+    # At a Glance
+    blocks.append(heading2("\u26a1 At a glance \u2014 last 7 days"))
+
+    dau_signal = f"today: {metrics['dau_today']}, 7d avg: {metrics['dau_7d_avg']}"
+    form_signal = ""
+    if metrics['dau_7d_avg'] > 0:
+        form_signal = f"{round(metrics['entry_form_started_7d'] / (metrics['dau_7d_avg'] * 7), 1)} attempts per user" if metrics['dau_7d_avg'] > 0 else ""
+
+    entries_signal = ""
+    if metrics['entries_logged_7d'] == 0:
+        entries_signal = "\U0001f6a8 zero entries this week"
+    elif metrics['entries_logged_7d'] < 3:
+        entries_signal = "\U0001f6a8 very low"
+
+    glance_lines = [
+        f"Metric              | Value  | Signal",
+        f"--------------------|--------|---------------------------",
+        f"Avg daily users     | {metrics['dau_7d_avg']}    | {dau_signal}",
+        f"Forms started       | {metrics['entry_form_started_7d']}     | {form_signal}",
+        f"Entries logged      | {metrics['entries_logged_7d']}     | {entries_signal}",
+        f"Upgrade clicks      | {metrics['upgrade_clicked_7d']}     | modal opened: {metrics['upgrade_modal_opened_7d']}",
+    ]
+    blocks.append(paragraph("\n".join(glance_lines)))
+    blocks.append(divider())
+
+    # Form Funnel
+    blocks.append(heading2("\U0001f53d Form funnel"))
+    form_started = metrics["entry_form_started_7d"]
+    entries_logged = metrics["entries_logged_7d"]
+    upgrade_clicked = metrics["upgrade_clicked_7d"]
+
+    if form_started > 0:
+        entry_rate = round(entries_logged / form_started * 100)
+        entry_bar = _bar(entry_rate)
+        flag = " \U0001f6a8" if entry_rate < 30 else ""
+    else:
+        entry_rate = 0
+        entry_bar = _bar(0)
+        flag = ""
+
+    funnel_lines = [
+        f"Step             | Count | Bar                  | Rate",
+        f"-----------------|-------|----------------------|------",
+        f"Form started     | {form_started:>5} | {_bar(100)}  | 100%",
+        f"Entry logged     | {entries_logged:>5} | {entry_bar}  | {entry_rate}%{flag}",
+        f"Upgrade clicked  | {upgrade_clicked:>5} | {_bar(min(100, (upgrade_clicked / max(form_started, 1)) * 100))}  | \u2014",
+    ]
+    blocks.append(paragraph("\n".join(funnel_lines)))
+
+    if form_started > 0 and entry_rate < 30:
+        blocks.append(paragraph(
+            f"\U0001f6a8 {100 - entry_rate}% of users who open the form never finish it. "
+            f"Consider adding step_completed PostHog events to identify the drop-off point."
+        ))
+    blocks.append(divider())
+
+    # Where Users Go (tab views)
+    blocks.append(heading2("\U0001f4d1 Where users go"))
+    if tab_counts:
+        max_views = max(tab_counts.values()) if tab_counts else 1
+        tab_lines = [
+            "Tab              | Views | Bar",
+            "-----------------|-------|----------------------",
+        ]
+        for tab_name, views in sorted(tab_counts.items(), key=lambda x: -x[1]):
+            pct = round(views / max_views * 100)
+            tab_lines.append(f"{tab_name:<16} | {views:>5} | {_bar(pct)} {pct}%")
+        blocks.append(paragraph("\n".join(tab_lines)))
+    else:
+        blocks.append(paragraph("No tab_viewed events recorded this week."))
+    blocks.append(divider())
+
+    # Issues to fix (from suggestions)
+    blocks.append(heading2("\U0001f6a8 Issues to fix"))
+    if suggestions:
+        for i, s in enumerate(suggestions, 1):
+            severity = "\U0001f534" if s["priority"] <= 2 else ("\U0001f7e1" if s["priority"] == 3 else "\U0001f535")
+            blocks.append(paragraph(
+                f"{severity} #{i} \u00b7 {s['text']}\n"
+                f"   Necessary? {s['necessary']}"
+            ))
+    else:
+        blocks.append(paragraph("No critical issues detected today."))
+    blocks.append(divider())
+
+    # Today's suggestion
+    blocks.append(heading2("\U0001f4a1 Today's suggestion"))
+    top = suggestions[0]["text"] if suggestions else "No action needed today \u2014 metrics are stable."
+    blocks.append(paragraph(f"\u2728 {top}"))
+    blocks.append(divider())
+
+    # Footer links
+    blocks.append(paragraph(
+        "\u2192 \U0001f4cb Daily Analysis Log \u00b7 \U0001f916 Automation Setup"
+    ))
+
+    return blocks
+
+
+def refresh_analytics_page(metrics, suggestions, tab_counts):
+    """Clear and rewrite the 'dear date — analytics' Notion page."""
+    print("  Clearing old analytics page content...")
+    _clear_page_blocks(NOTION_ANALYTICS_PAGE_ID)
+
+    print("  Writing new analytics content...")
+    blocks = build_analytics_blocks(metrics, suggestions, tab_counts)
+
+    # Notion API allows max 100 blocks per append call
+    url = f"https://api.notion.com/v1/blocks/{NOTION_ANALYTICS_PAGE_ID}/children"
+    for i in range(0, len(blocks), 100):
+        chunk = blocks[i:i + 100]
+        try:
+            r = requests.patch(url, headers=notion_headers(), json={"children": chunk}, timeout=30)
+            print(f"  Analytics page append (blocks {i}-{i+len(chunk)-1}): HTTP {r.status_code}")
+            if not r.ok:
+                print(f"  ❌ Error: {r.text[:500]}")
+                return False
+        except Exception as e:
+            print(f"  ❌ Exception appending blocks: {e}")
+            return False
+
+    print("  ✅ Analytics page refreshed.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 6. Stdout summary
 # ---------------------------------------------------------------------------
 
@@ -557,6 +762,8 @@ def main():
     trends = fetch_posthog_trends(date_from, date_to)
     print("Fetching PostHog DAU...")
     dau_data = fetch_posthog_dau(date_from, date_to)
+    print("Fetching PostHog tab views...")
+    tab_counts = fetch_posthog_tab_views(date_from, date_to)
 
     # Step 3: Fetch Supabase data
     print("Fetching Supabase data...")
@@ -579,8 +786,14 @@ def main():
         supabase_entry_count, recent_entries,
     )
 
-    if success:
-        print("\n✅ Daily analysis complete!")
+    # Step 7: Refresh analytics page
+    print("\nRefreshing analytics page...")
+    analytics_ok = refresh_analytics_page(metrics, suggestions, tab_counts)
+
+    if success and analytics_ok:
+        print("\n✅ Daily analysis complete! Database entry + analytics page refreshed.")
+    elif success:
+        print("\n⚠️  Database entry created but analytics page refresh failed.")
     else:
         print("\n⚠️  Analysis computed but Notion write failed. Check logs above.")
         sys.exit(1)
