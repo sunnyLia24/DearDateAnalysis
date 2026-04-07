@@ -749,11 +749,9 @@ def main():
         print(f"❌ Missing environment variables: {', '.join(missing)}")
         sys.exit(1)
 
-    # Step 1: Dedup check
+    # Step 1: Dedup check (only for database entry — analytics page always refreshes)
     print("Checking for existing entry in Notion...")
-    if check_already_ran():
-        print("Already ran today, skipping.")
-        sys.exit(0)
+    already_ran = check_already_ran()
 
     # Step 2: Fetch PostHog data (14 days for comparison)
     date_from = (TODAY - timedelta(days=13)).isoformat()
@@ -779,21 +777,25 @@ def main():
     # Step 5: Print summary to stdout
     print_summary(metrics, health_status, health_reason, suggestions, supabase_entry_count)
 
-    # Step 6: Write to Notion
-    print("\nWriting to Notion...")
-    success = write_to_notion(
-        metrics, health_status, health_reason, suggestions,
-        supabase_entry_count, recent_entries,
-    )
+    # Step 6: Write to Notion database (skip if already ran today)
+    if already_ran:
+        print("\nDatabase entry already exists for today — skipping write.")
+        success = True
+    else:
+        print("\nWriting to Notion database...")
+        success = write_to_notion(
+            metrics, health_status, health_reason, suggestions,
+            supabase_entry_count, recent_entries,
+        )
 
-    # Step 7: Refresh analytics page
+    # Step 7: Always refresh analytics page
     print("\nRefreshing analytics page...")
     analytics_ok = refresh_analytics_page(metrics, suggestions, tab_counts)
 
     if success and analytics_ok:
         print("\n✅ Daily analysis complete! Database entry + analytics page refreshed.")
     elif success:
-        print("\n⚠️  Database entry created but analytics page refresh failed.")
+        print("\n⚠️  Database entry OK but analytics page refresh failed.")
     else:
         print("\n⚠️  Analysis computed but Notion write failed. Check logs above.")
         sys.exit(1)
